@@ -667,11 +667,14 @@ func getOrderByUserKeyTx(ctx context.Context, tx *sql.Tx, userID int64, key stri
 }
 
 func getOrderByNoTx(ctx context.Context, tx *sql.Tx, orderNo string, userID int64) (*model.Order, error) {
+	// Lock the order row so payment sees the latest committed status when it
+	// races with cancellation; a plain snapshot read can be stale in
+	// REPEATABLE READ and misclassify PAY_AFTER_CANCEL as inconsistent state.
 	order, err := scanOrder(tx.QueryRowContext(ctx, `
 		SELECT id, order_no, user_id, activity_id, item_id, quantity, amount_cents,
 		       idempotency_key, payload_hash, reservation_id, status, expire_at,
 		       paid_at, cancelled_at, created_at
-		  FROM orders WHERE order_no = ? AND user_id = ?`, orderNo, userID))
+		  FROM orders WHERE order_no = ? AND user_id = ? FOR UPDATE`, orderNo, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

@@ -2,8 +2,10 @@ package integration
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -282,6 +284,7 @@ func TestA2RestartDoesNotOverwriteInFlightReservation(t *testing.T) {
 // (expired) restock marker must not trigger a second Redis restock.
 func TestA3RestockMarkerMissingDoesNotDoubleRestock(t *testing.T) {
 	store, gate := setup(t, time.Millisecond)
+	drainExpiredOrders(t, store, gate)
 	item := createItem(t, store, gate, 1, 1)
 	ctx := context.Background()
 	req := reserveOne(t, gate, item, 7002, fmt.Sprintf("a3-marker-%d", time.Now().UnixNano()), 1)
@@ -294,8 +297,8 @@ func TestA3RestockMarkerMissingDoesNotDoubleRestock(t *testing.T) {
 	}
 	time.Sleep(20 * time.Millisecond)
 	svc := service.New(store, gate, config.Config{CancelBatch: 10})
-	if n, err := svc.CancelExpired(ctx); err != nil || n < 1 {
-		t.Fatalf("first cancel n=%d err=%v", n, err)
+	if n, err := svc.CancelExpired(ctx); err != nil || n != 1 {
+		t.Fatalf("first cancel n=%d err=%v, want 1 after draining", n, err)
 	}
 	marker := gate.Prefix() + "restocked:" + out.Order.OrderNo
 	if exists, _ := gate.Client().Exists(ctx, marker).Result(); exists != 1 {
@@ -307,8 +310,8 @@ func TestA3RestockMarkerMissingDoesNotDoubleRestock(t *testing.T) {
 	if err := gate.Client().Del(ctx, marker).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.CancelExpired(ctx); err != nil {
-		t.Fatalf("second cancel: %v", err)
+	if n, err := svc.CancelExpired(ctx); err != nil || n != 0 {
+		t.Fatalf("second cancel n=%d err=%v, want 0 after draining", n, err)
 	}
 	stock, _, err := gate.GetStock(ctx, item.ID)
 	if err != nil || stock != 1 {
@@ -528,10 +531,71 @@ func TestA7QueueFullDoesNotDeduct(t *testing.T) {
 	}
 }
 
+// TestPaymentRaceReturnsPayAfterCancel deterministically forces the window
+// where MarkPaid has read PENDING_PAYMENT but a concurrent cancellation commits
+// before its conditional update. The loser must report PAY_AFTER_CANCEL
+// (SPEC 4.5/5.4), not SERVICE_UNAVAILABLE from a stale snapshot re-read.
+func TestPaymentRaceReturnsPayAfterCancel(t *testing.T) {
+	store, gate := setup(t, time.Hour)
+	item := createItem(t, store, gate, 1, 1)
+	ctx := context.Background()
+	req := reserveOne(t, gate, item, 7041, fmt.Sprintf("a7-payrace-%d", time.Now().UnixNano()), 1)
+	out, err := store.HandleReservation(ctx, mysqlrepo.ReservationInput{
+		ReservationID: req.ReservationID, UserID: req.UserID, IdempotencyKey: req.Key,
+		ItemID: req.ItemID, Quantity: req.Quantity, PayloadHash: req.PayloadHash,
+	})
+	if err != nil || out.Order == nil {
+		t.Fatalf("handle: %+v %v", out, err)
+	}
+	orderNo := out.Order.OrderNo
+
+	dsn := os.Getenv("SECKILL_IT_DSN")
+	raw, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open raw sql: %v", err)
+	}
+	defer raw.Close()
+
+	// Hold the order row lock with an uncommitted cancellation.
+	tx, err := raw.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin raw tx: %v", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE orders SET status = 'CANCELLED', cancelled_at = CURRENT_TIMESTAMP(3)
+		 WHERE order_no = ? AND status = 'PENDING_PAYMENT'`, orderNo)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("raw cancel: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		_ = tx.Rollback()
+		t.Fatalf("raw cancel affected %d rows", n)
+	}
+
+	payErrCh := make(chan error, 1)
+	go func() {
+		_, err := store.MarkPaid(context.Background(), req.UserID, orderNo, "txn-pay-race", out.Order.AmountCents)
+		payErrCh <- err
+	}()
+
+	// Let MarkPaid read PENDING_PAYMENT and block on the conditional update.
+	time.Sleep(300 * time.Millisecond)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit raw cancel: %v", err)
+	}
+
+	payErr := <-payErrCh
+	if !errors.Is(payErr, mysqlrepo.ErrPayAfterCancel) {
+		t.Fatalf("expected PAY_AFTER_CANCEL, got %v", payErr)
+	}
+}
+
 // TestPayCancelRaceOnlyOneWins verifies SPEC 4.5/5.4: payment and cancellation
 // compete via conditional updates and exactly one terminal state wins.
 func TestPayCancelRaceOnlyOneWins(t *testing.T) {
 	store, gate := setup(t, time.Millisecond)
+	drainExpiredOrders(t, store, gate)
 	item := createItem(t, store, gate, 1, 1)
 	ctx := context.Background()
 	req := reserveOne(t, gate, item, 7040, fmt.Sprintf("a7-race-%d", time.Now().UnixNano()), 1)

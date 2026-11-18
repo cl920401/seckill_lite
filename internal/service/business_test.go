@@ -281,6 +281,68 @@ func TestRequestIDDeterministic(t *testing.T) {
 	}
 }
 
+// MySQL is the authoritative source (SPEC 4.2(3)). A polluted/stale Redis
+// fingerprint must not override a confirmed historical order for the same key
+// and payload.
+func TestStaleRedisFingerprintDoesNotOverrideDBHistory(t *testing.T) {
+	item := testItem()
+	hash := PayloadHash(item.ID, 1)
+	order := &model.Order{
+		OrderNo: "SK1", UserID: 1, ItemID: item.ID, Quantity: 1,
+		PayloadHash: hash, Status: "PENDING_PAYMENT",
+	}
+	gate := newFakeGate(10, item)
+	gate.states[stateKey(1, "key-12345")] = redisrepo.RequestState{
+		Status: "PROCESSING", PayloadHash: "stale-fingerprint", ReservationID: "res-stale",
+	}
+	svc := New(&fakeStore{item: &item, order: order}, gate, testConfig())
+
+	res, err := svc.Seckill(context.Background(), 1, "key-12345", item.ID, 1)
+	if err != nil {
+		t.Fatalf("expected DB history, got error: %v", err)
+	}
+	if res.HTTPStatus != 200 || res.Order == nil || res.Order.OrderNo != "SK1" {
+		t.Fatalf("expected historical order, got %+v", res)
+	}
+}
+
+// oneMissThenHistoryStore returns no history on the first lookup and the
+// seeded history afterwards, so the service reaches Reserve and then must fall
+// back to MySQL when the Lua script reports CONFLICT.
+type oneMissThenHistoryStore struct {
+	*fakeStore
+	missed bool
+}
+
+func (s *oneMissThenHistoryStore) LookupRequest(ctx context.Context, userID int64, key string) (*model.Order, *model.RequestResult, error) {
+	if !s.missed {
+		s.missed = true
+		return nil, nil, nil
+	}
+	return s.fakeStore.LookupRequest(ctx, userID, key)
+}
+
+func TestReserveConflictFallsBackToDBHistory(t *testing.T) {
+	item := testItem()
+	hash := PayloadHash(item.ID, 1)
+	order := &model.Order{
+		OrderNo: "SK1", UserID: 1, ItemID: item.ID, Quantity: 1,
+		PayloadHash: hash, Status: "PENDING_PAYMENT",
+	}
+	store := &oneMissThenHistoryStore{fakeStore: &fakeStore{item: &item, order: order}}
+	gate := newFakeGate(10, item)
+	gate.reserveCode = "CONFLICT"
+	svc := New(store, gate, testConfig())
+
+	res, err := svc.Seckill(context.Background(), 1, "key-12345", item.ID, 1)
+	if err != nil {
+		t.Fatalf("expected DB history fallback, got error: %v", err)
+	}
+	if res.Order == nil || res.Order.OrderNo != "SK1" {
+		t.Fatalf("expected historical order, got %+v", res)
+	}
+}
+
 func assertAppCode(t *testing.T, err error, code string) *AppError {
 	t.Helper()
 	if err == nil {

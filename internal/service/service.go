@@ -141,15 +141,17 @@ func (s *Service) Seckill(ctx context.Context, userID int64, idempotencyKey stri
 		return nil, wrap(ErrServiceUnavailable, redisErr)
 	}
 	if state != nil {
-		if state.PayloadHash != "" && state.PayloadHash != payloadHash {
-			return nil, wrap(ErrIdempotencyConflict, nil)
-		}
+		// MySQL is authoritative. Consult durable history before trusting the
+		// Redis fingerprint, which may be stale or polluted.
 		res, found, err := s.lookupHistoryGuarded(ctx, userID, idempotencyKey, payloadHash, requestID)
 		if err != nil {
 			return nil, err
 		}
 		if found {
 			return res, nil
+		}
+		if state.PayloadHash != "" && state.PayloadHash != payloadHash {
+			return nil, wrap(ErrIdempotencyConflict, nil)
 		}
 		switch state.Status {
 		case "PROCESSING":
@@ -219,6 +221,12 @@ func (s *Service) Seckill(ctx context.Context, userID int64, idempotencyKey stri
 			return nil, wrap(ErrResultUnknown, nil)
 		}
 	case "CONFLICT":
+		// The Lua fingerprint may be stale; MySQL history wins when present.
+		if res, found, err := s.lookupHistoryGuarded(ctx, userID, idempotencyKey, payloadHash, requestID); err != nil {
+			return nil, err
+		} else if found {
+			return res, nil
+		}
 		return nil, wrap(ErrIdempotencyConflict, nil)
 	case "SOLD_OUT":
 		return nil, wrap(ErrSoldOut, nil)

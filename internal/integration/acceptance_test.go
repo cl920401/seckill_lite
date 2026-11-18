@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	mysqldrv "github.com/go-sql-driver/mysql"
 
 	"seckill_lite/internal/config"
 	"seckill_lite/internal/model"
@@ -200,6 +204,7 @@ func TestA2bFirstPurchaseLimit(t *testing.T) {
 
 func TestA3CancelRestockOnce(t *testing.T) {
 	store, gate := setup(t, time.Millisecond)
+	drainExpiredOrders(t, store, gate)
 	item := createItem(t, store, gate, 1, 1)
 	key := fmt.Sprintf("it-a3-%d", time.Now().UnixNano())
 	hash := service.PayloadHash(item.ID, 1)
@@ -221,8 +226,8 @@ func TestA3CancelRestockOnce(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	svc := service.New(store, gate, config.Config{CancelBatch: 10})
 	n, err := svc.CancelExpired(context.Background())
-	if err != nil || n < 1 {
-		t.Fatalf("first cancel n=%d err=%v", n, err)
+	if err != nil || n != 1 {
+		t.Fatalf("first cancel n=%d err=%v, want 1 after draining", n, err)
 	}
 	n, err = svc.CancelExpired(context.Background())
 	if err != nil || n != 0 {
@@ -291,6 +296,7 @@ func TestA4WorkerReclaimsPending(t *testing.T) {
 
 func TestPaymentIdempotentAndAfterCancel(t *testing.T) {
 	store, gate := setup(t, time.Millisecond)
+	drainExpiredOrders(t, store, gate)
 	item := createItem(t, store, gate, 1, 1)
 	key := fmt.Sprintf("it-a5-%d", time.Now().UnixNano())
 	req := redisrepo.ReserveRequest{
@@ -495,7 +501,14 @@ func setup(t *testing.T, expire time.Duration) (*mysqlrepo.Store, *redisrepo.Gat
 	}
 	dsn := os.Getenv("SECKILL_IT_DSN")
 	if dsn == "" {
-		dsn = "root@tcp(127.0.0.1:3306)/seckill?parseTime=true&loc=UTC&charset=utf8mb4"
+		t.Fatal("SECKILL_IT_DSN must be set to a dedicated *_test database (for example seckill_test)")
+	}
+	cfg, err := mysqldrv.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("invalid SECKILL_IT_DSN: %v", err)
+	}
+	if !strings.HasSuffix(cfg.DBName, "_test") {
+		t.Fatalf("refusing to run integration tests against non-test database %q; use a *_test database", cfg.DBName)
 	}
 	store, err := mysqlrepo.Open(dsn, expire)
 	if err != nil {
@@ -506,7 +519,15 @@ func setup(t *testing.T, expire time.Duration) (*mysqlrepo.Store, *redisrepo.Gat
 	if redisAddr == "" {
 		redisAddr = "127.0.0.1:6379"
 	}
-	gate := redisrepo.New(redisAddr, "", 0, prefix, prefix+"stream:orders", "it-workers", time.Hour)
+	rawDB := os.Getenv("SECKILL_IT_REDIS_DB")
+	if rawDB == "" {
+		t.Fatal("SECKILL_IT_REDIS_DB must be set to a dedicated logical DB (for example 15)")
+	}
+	redisDB, err := strconv.Atoi(rawDB)
+	if err != nil || redisDB < 0 {
+		t.Fatalf("invalid SECKILL_IT_REDIS_DB %q", rawDB)
+	}
+	gate := redisrepo.New(redisAddr, "", redisDB, prefix, prefix+"stream:orders", "it-workers", time.Hour)
 	if err := gate.EnsureGroup(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -540,4 +561,24 @@ func createItem(t *testing.T, store *mysqlrepo.Store, gate *redisrepo.Gateway, s
 		t.Fatal(err)
 	}
 	return item
+}
+
+// drainExpiredOrders cancels any already-expired PENDING_PAYMENT orders before a
+// cancellation test starts. CancelExpired scans the whole test database, so
+// without draining, leftovers from earlier runs would be processed alongside the
+// order under test. Integration tests run serially against a dedicated *_test
+// database; this helper makes that assumption explicit and repeatable.
+func drainExpiredOrders(t *testing.T, store *mysqlrepo.Store, gate *redisrepo.Gateway) {
+	t.Helper()
+	svc := service.New(store, gate, config.Config{CancelBatch: 100})
+	for i := 0; i < 1000; i++ {
+		n, err := svc.CancelExpired(context.Background())
+		if err != nil {
+			t.Fatalf("drain expired orders: %v", err)
+		}
+		if n == 0 {
+			return
+		}
+	}
+	t.Fatal("drain expired orders did not converge")
 }

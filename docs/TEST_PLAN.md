@@ -17,8 +17,8 @@
 - 高并发“全都成功”、跨系统强一致、自动对账/修复、exactly-once、真实高可用、已验证 1000 RPS 均**不是承诺**。
 - P0（4～6 小时必测）：不超卖、同键幂等、取消回补、消息重投/补偿、依赖故障安全行为。
 - P1（有余力）：真实停服/杀进程、完整指标、大规模压测、HTTP 真栈、并发认领、限流细节。
-- 边界内不一致：Fix-2/3/4/7（见第 5 节）。已知限制：Redis 回补不自动重试、无指标平台（见第 5 节）。
-- 针对性补充用例：T1～T5（见第 6 节）。其中 T3 依赖 Fix-7，修复前预期失败，不纳入门禁。
+- 边界内不一致：**Fix-3、Fix-7 已修复并验证**（第 2 轮）；仍待处理：Fix-2（P1）、Fix-4（P2）。已知限制：Redis 回补不自动重试、无指标平台（见第 5 节）。
+- 针对性补充用例：T1～T5（见第 6 节）；T3 已随 Fix-7 修复并通过。
 
 ---
 
@@ -229,14 +229,14 @@
 ### 4.1 单元测试（无外部依赖）
 
 - `internal/httpapi/api_test.go`：接受/默认 quantity、鉴权、未知字段、错误映射+`Retry-After`、REJECTED 回放、查询状态、列表越权、订单不存在、支付、管理员鉴权、ready、panic 兜底。
-- `internal/service/service_test.go` + `business_test.go`：同键并发、全局限流优先、历史回放、Redis 故障回退、售罄、活动窗、输入边界、限购、状态语义、错误映射、取消回补、`requestId` 确定性。
+- `internal/service/service_test.go` + `business_test.go`：同键并发、全局限流优先、历史回放、Redis 故障回退、售罄、活动窗、输入边界、限购、状态语义、错误映射、取消回补、`requestId` 确定性；**Fix-7 专项**：`TestStaleRedisFingerprintDoesNotOverrideDBHistory`、`TestReserveConflictFallsBackToDBHistory`（Redis 指纹污染时以 MySQL 历史为准）。
 - `internal/worker/worker_test.go`：DONE 只 ACK、拒绝补偿+DONE、成功回填、MISS 保留 pending、store 错误、未知 outcome；**本轮新增**：补偿脚本异常不写 DONE、DONE 持久化失败不 ACK、`MarkSuccess` 缓存失败仍 ACK（DB 权威）、坏消息保留+告警日志。
 - `internal/redisrepo/gateway_test.go`：Lua 契约（需 `SECKILL_REDIS_IT=1`）。
 
-### 4.2 集成测试（需 `SECKILL_IT=1`，本轮未执行）
+### 4.2 集成测试（需 `SECKILL_IT=1`；第 2 轮已在 seckill_test + Redis db15 执行 23/23 通过）
 
-- `acceptance_test.go`：A1 repo 层并发、A2 同键、A2b 限购、A3 取消回补、A4 认领+重投、支付/取消、拒绝补偿、端到端 service 流程、DB 最终防超卖。**新增守卫/隔离**：`SECKILL_IT_DSN` 必须为 `*_test`；取消用例先 `drainExpiredOrders`。
-- `reliability_test.go`：A5 Redis 停/历史优先/MySQL 预扣前故障/结果不明；A2 删键回放/重启不覆盖；A3 标记缺失不双补；A4 提交未 ACK 重投/补偿崩溃窗口；额外预约；A7 全局限流含回放/队列满；支付取消竞争。
+- `acceptance_test.go`：A1 repo 层并发、A2 同键、A2b 限购、A3 取消回补、A4 认领+重投、支付/取消、拒绝补偿、端到端 service 流程、DB 最终防超卖。**守卫/隔离**：`SECKILL_IT_DSN` 必须为 `*_test`；`SECKILL_IT_REDIS_DB` 必须显式指定（本轮 15）；取消用例先 `drainExpiredOrders`。
+- `reliability_test.go`：A5 Redis 停/历史优先/MySQL 预扣前故障/结果不明；A2 删键回放/重启不覆盖；A3 标记缺失不双补；A4 提交未 ACK 重投/补偿崩溃窗口；额外预约；A7 全局限流含回放/队列满；支付取消竞争；**Fix-3 专项**：`TestPaymentRaceReturnsPayAfterCancel`（持锁取消后支付必须返回 `PAY_AFTER_CANCEL`）。
 
 ### 4.3 缺口清单
 
@@ -248,9 +248,9 @@
 | MySQL 检查后故障 D3 | 无钩子 | P1/无法验证 | 测试钩子；不引入死信/自动恢复 |
 | 真实 24h TTL | 用删键模拟 | 无法验证 | 删键/缩短配置替代 |
 | 查询限流 L4 | 未覆盖 | P1 | 增加 HTTP 429 用例 |
-| 支付/取消并发错误码 | 只断言终态 | P1 | 依赖 Fix-3 后断言 |
-| Worker 退避/`attempts` | 未实现 | 需修复 | 见 Fix-2（P1） |
-| 缓存权威性（Redis payload 先于 DB） | 可能误报冲突 | 需修复 | 见 Fix-7（P1） |
+| 支付/取消并发错误码 | 只断言终态 | 已补 | Fix-3 已修复；新增 `TestPaymentRaceReturnsPayAfterCancel` 断言 `PAY_AFTER_CANCEL` |
+| Worker 退避/`attempts` | 未实现 | 需修复 | 见 Fix-2（P1，未处理） |
+| 缓存权威性（Redis payload 先于 DB） | 可能误报冲突 | 已补 | Fix-7 已修复；新增 2 个单测 |
 | 完整指标 | 无监控平台 | 已知限制 | 见第 7 节；不默认视为缺陷 |
 | 1000 RPS / 200 单每秒 | 未验证 | 目标 | 压测报告标注目标/实测 |
 
@@ -258,25 +258,30 @@
 
 ## 5. 需要修复 / 已知限制 / 待确认
 
-> 以下来自代码审阅，非测试执行结论。修复前不得把相关 P1 用例标记为通过。
+> 以下来自代码审阅与测试执行。只有登记在第 10 节的执行结果才可标记通过。
 
-### 5.1 需要修复（边界内与 SPEC 不一致）
+### 5.1 已修复并验证（本轮）
+
+| 编号 | 问题 | 最小修复 | 复现/验证 | 结果 |
+|---|---|---|---|---|
+| Fix-3 | 支付/取消在 REPEATABLE READ 下用快照读再条件更新，竞争失败方返回 503 而非 `PAY_AFTER_CANCEL` | `internal/mysqlrepo/store.go` 的 `getOrderByNoTx` 改为 `... FOR UPDATE`（当前读） | 新增 `TestPaymentRaceReturnsPayAfterCancel`：原始事务持锁取消→提交→支付竞争，断言 `PAY_AFTER_CANCEL`；修复前实际得到 `inconsistent durable state` | 第 2 轮 PASS |
+| Fix-7 | `Seckill` 在 Redis 幂等态 fingerprint 不一致时直接返回冲突，未先查 MySQL 历史 | `internal/service/service.go`：`state != nil` 分支先查 MySQL 历史；`Reserve` 返回 `CONFLICT` 时同样回查历史 | 新增 `TestStaleRedisFingerprintDoesNotOverrideDBHistory`、`TestReserveConflictFallsBackToDBHistory`；修复前均返回 `IDEMPOTENCY_CONFLICT` | 第 2 轮 PASS |
+
+### 5.2 仍待处理（边界内与 SPEC 不一致，未在本轮修复）
 
 | 编号 | 问题 | 依据 | 影响 | 优先级 |
 |---|---|---|---|---|
 | Fix-2 | Worker 失败仅记日志，无退避/`attempts`/`last_error`/阈值告警 | 4.3(5)(6) | 重试行为与可观测性不符；`reservation_results.attempts` 未写 | P1 |
-| Fix-3 | 支付/取消在 REPEATABLE READ 下用快照读再条件更新，竞争失败方可能返回 503 而非 `PAY_AFTER_CANCEL` | 4.5、5.4 | 错误码语义不符（终态仍正确） | P1 |
 | Fix-4 | Worker 事务先建 RR 快照、后 `FOR UPDATE`；订单读取用旧快照 | 4.3(2) | 并发同键不同预约可能先返回 `ErrInconsistent`，重试后才回填（不重复建单） | P2 |
-| Fix-7 | `Seckill` 在 Redis 幂等态 payload 指纹不一致时直接返回冲突，未先查 MySQL 历史 | 4.2(3)“以 MySQL 当前状态为准”、6.3 | 非权威缓存可能覆盖已确认订单，返回错误的 `IDEMPOTENCY_CONFLICT` | P1 |
 
-### 5.2 已知限制（不要求新增机制）
+### 5.3 已知限制（不要求新增机制）
 
 | 编号 | 限制 | 依据 | 处理 |
 |---|---|---|---|
 | L-RedisRestock | 取消后 Redis 回补失败只告警，不做自动重试/恢复；MySQL 已正确回补，Redis 可能暂时少卖 | 4.6(3) | 列为已知限制；人工处理；24h marker 仅覆盖“若重试”的幂等，不要求实现重试 |
 | L-Metrics | 无指标/监控平台；现有结构化日志提供告警证据（见第 7 节） | 4.6/7.2 | 默认不认定为缺陷；若验收要求“指标”，再单独立项 |
 
-### 5.3 已澄清（不是缺陷）
+### 5.4 已澄清（不是缺陷）
 
 - **预扣前 MySQL 检查**：下单在任何缓存读取前先执行 MySQL 幂等查询；MySQL 不可用会在此返回 503，不进入 Lua/缓存分支。原“缺少预扣前依赖检查”的判断撤回。检查通过后的故障按 G6b 结果不明处理，不要求无副作用。
 
@@ -290,11 +295,11 @@
 |---|---|---|---|---|---|---|
 | T1 | **P0** | 补偿脚本异常不误记完成 | 预约终态 `REJECTED`，`Compensate` 返回错误/异常 | Worker 处理 | 返回错误；不写 `compensation_state=DONE`；不 ACK；消息保留 | 已补单测 `TestProcessCompensationErrorKeepsPending` |
 | T2 | P1 | DONE 持久化失败不 ACK | 补偿成功但 `MarkCompensationDone` 报错 | Worker 处理 | 不 ACK；保持 pending；重复投递可重试 | 已补单测 `TestProcessMarkDoneErrorKeepsPending` |
-| T3 | P1 | 历史订单不被非权威缓存覆盖 | DB 已有订单（payload A）；Redis `sk:req` 指纹被污染为 B | 同键同 payload A 重试 | 返回 DB 订单 `200`；不得返回 `IDEMPOTENCY_CONFLICT` | **阻塞于 Fix-7**；修复前预期失败，不纳入门禁 |
+| T3 | P1 | 历史订单不被非权威缓存覆盖 | DB 已有订单（payload A）；Redis `sk:req` 指纹被污染为 B | 同键同 payload A 重试 | 返回 DB 订单 `200`；不得返回 `IDEMPOTENCY_CONFLICT` | **Fix-7 已修复并验证**；`TestStaleRedisFingerprintDoesNotOverrideDBHistory` + `TestReserveConflictFallsBackToDBHistory` PASS |
 | T4 | **P0** | 坏消息保留+告警+不误确认 | Worker 处理失败（DB 错误/补偿 MISS） | 处理消息 | 不 ACK；输出保持 pending 告警日志；不写 DONE；不引入死信系统 | 已补单测 `TestProcessFailureLogsAndKeepsPending`；MISS 由 `TestProcessCompensationMISSKeepsPending` 覆盖 |
 | T5 | P1 | 成功缓存失败不推翻订单 | DB 已提交订单，`MarkSuccess` 失败 | Worker 处理 | 仍 ACK；记录“DB authoritative”日志；订单有效 | 已补单测 `TestProcessMarkSuccessCacheFailureStillAcks` |
 
-说明：T1/T4 属于“坏消息不误确认”的安全行为，不要求引入 DLQ；T3 暴露的是 Fix-7，需先修业务代码，测试随后纳入 P1。
+说明：T1/T4 属于“坏消息不误确认”的安全行为，不要求引入 DLQ；T3 暴露的 Fix-7 已修复，进入回归。Fix-3 另有专项集成用例 `TestPaymentRaceReturnsPayAfterCancel`。
 
 ---
 
@@ -322,7 +327,7 @@
 3. **全量单元**：`go test -race ./...`（无 env 时集成/Lua 自动跳过）。
 4. **Lua 契约（独立 Redis）**：`SECKILL_REDIS_IT=1 SECKILL_IT_REDIS=... go test -race ./internal/redisrepo`。
 5. **集成 P0（独立 `*_test` 库，需确认）**：串行 `-p 1`，按 A1→A2→A3→A4→A5→A6→A7。
-6. **集成 P1**：HTTP 真栈、并发认领、查询限流、支付取消错误码（依赖 Fix-3）、T3（依赖 Fix-7）。
+6. **集成 P1**：HTTP 真栈、并发认领、查询限流、支付取消错误码回归（`TestPaymentRaceReturnsPayAfterCancel`）、T3 回归（`TestStaleRedisFingerprint...`/`TestReserveConflict...`）。
 7. **人工故障演练（需授权）**：真实停 Redis/MySQL、`SIGKILL` Worker，核对 G6b/S2/S3 安全行为。
 8. **压测（需授权）**：`cmd/loadtest` + `scripts/verify.sql`，记录目标/实测、环境、并发、P99、错误分布。
 
@@ -364,11 +369,30 @@ go run ./cmd/loadtest -n 1000 -c 200 -item <id> -activity <id> -mode unique -pol
 
 ---
 
-## 10. 执行记录（待填写）
+## 10. 执行记录
 
-| 日期 | 环境（OS/Go/MySQL/Redis） | 命令 | 范围 | 结果 | 执行人 | 备注 |
-|---|---|---|---|---|---|---|
-| YYYY-MM-DD |  |  | 单元/Lua/集成/压测 | 通过/失败/跳过 |  | 未执行项必须标注 |
+环境：macOS darwin/arm64；Go 1.27.4；MySQL `127.0.0.1:3306`；Redis `127.0.0.1:6379`。
+数据隔离：MySQL 专用库 `seckill_test`（已授权复用，测试会 drain 历史过期 PENDING）；Redis 逻辑库 `db15`（测试前 0，测试后 0）。未连接 `seckill_lite` 或 db0。
+
+| 轮次/日期 | 命令（摘要） | 范围 | 结果 | 备注 |
+|---|---|---|---|---|
+| R1 2026-11-19 | `gofmt -l .` / `go vet ./...` / `go build ./...` | 静态 | PASS | 无输出 / exit 0 |
+| R1 2026-11-19 | `go test -race ./...` | 单元 | PASS | 未设 env 时集成/Lua 用例内部 skip（包编译通过） |
+| R1 2026-11-19 | `SECKILL_REDIS_IT=1 ... SECKILL_IT_REDIS_DB=15 go test -race ./internal/redisrepo -v` | Lua 契约 | PASS | `TestLuaContracts` |
+| R1 2026-11-19 | `SECKILL_IT=1 SECKILL_IT_DSN=.../seckill_test... SECKILL_IT_REDIS_DB=15 go test -race -p 1 ./internal/integration -v` | 集成 P0 | PASS 22/22 | 5.8s；db15 清理回 0 |
+| R1 2026-11-19 | 上述集成（观察） | Fix-3/Fix-7 | 未覆盖 | 现有用例未断言错误码/污染指纹；仅代码审阅判断存在 |
+| 修复前复现 | `go test -race ./internal/service -run 'TestStaleRedisFingerprint\|TestReserveConflictFallsBack'` | Fix-7 复现 | **FAIL** | 实际返回 `IDEMPOTENCY_CONFLICT` |
+| 修复前复现 | `... go test -race -p 1 ./internal/integration -run TestPaymentRaceReturnsPayAfterCancel` | Fix-3 复现 | **FAIL** | 实际返回 `inconsistent durable state`（映射 503） |
+| R2 2026-11-19 | `gofmt -l .` / `go vet ./...` / `go build ./...` | 静态 | PASS | 修复后 |
+| R2 2026-11-19 | `go test -race -count=1 ./...` | 单元 | PASS | 禁用缓存 |
+| R2 2026-11-19 | `... ./internal/service -run 'TestStaleRedisFingerprint\|TestReserveConflictFallsBack'` | Fix-7 验证 | PASS 2/2 | 返回 DB 历史 |
+| R2 2026-11-19 | `... ./internal/worker -v` | 补偿/坏消息回归 | PASS 10/10 | 无误写 DONE/误 ACK |
+| R2 2026-11-19 | `... ./internal/redisrepo -v` | Lua 契约 | PASS | db15 |
+| R2 2026-11-19 | `SECKILL_IT=1 ... -p 1 ./internal/integration -v` | 集成 P0 + Fix-3 | PASS 23/23 | 6.15s；含 `TestPaymentRaceReturnsPayAfterCancel` |
+| 未执行 | `golangci-lint run ./...` | 静态 | 未执行 | 未安装/未运行，不声称通过 |
+| 未执行 | 真实停 Redis/MySQL、`SIGKILL`、HTTP 真栈、压测/RPS、查询限流 L4、并发 `XAUTOCLAIM`、D3 钩子 | P1/无法验证 | 未执行 | 不计入通过 |
+
+已知数据残留：Redis `db0` 有 5 个旧版测试硬编码 DB0 遗留的 `sk:test:*` 键（非本轮写入，未清理，待授权处理）。`seckill_test` 会因集成测试持续累积订单（本轮后约 1110 条，其中 1064 条过期 PENDING）；下次运行由 `drainExpiredOrders` 清理，清库需另行确认。
 
 记录要求：
 - 写明机器配置、依赖版本、并发参数、数据规模。

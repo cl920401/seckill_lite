@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -18,9 +19,17 @@ func TestLuaContracts(t *testing.T) {
 	if addr == "" {
 		addr = "127.0.0.1:6379"
 	}
+	rawDB := os.Getenv("SECKILL_IT_REDIS_DB")
+	if rawDB == "" {
+		t.Fatal("SECKILL_IT_REDIS_DB must be set to a dedicated logical DB (for example 15)")
+	}
+	redisDB, err := strconv.Atoi(rawDB)
+	if err != nil || redisDB < 0 {
+		t.Fatalf("invalid SECKILL_IT_REDIS_DB %q", rawDB)
+	}
 	prefix := fmt.Sprintf("sk:test:%d:", time.Now().UnixNano())
 	stream := prefix + "stream:orders"
-	g := New(addr, "", 0, prefix, stream, "test-workers", time.Hour)
+	g := New(addr, "", redisDB, prefix, stream, "test-workers", time.Hour)
 	defer g.Close()
 	ctx := context.Background()
 	if err := g.EnsureGroup(ctx); err != nil {
