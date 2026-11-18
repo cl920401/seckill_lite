@@ -126,8 +126,9 @@ consumer: worker-{hostname}-{pid}
 - 调用前必须读持久预约终态：只有 outcome 为 REJECTED / EXTRA_RESERVATION 且 compensation_state=PENDING 才可补偿；DONE 直接 ACK，不因 Redis 标记缺失再次回补。同一成功预约也不补偿。
 - 正常首次补偿没有 marker 是预期情况，不等于 Redis 数据丢失。若已知/已检测到 Redis 数据丢失或人工重置，则先暂停相关处理并人工核查，不直接重放 PENDING 补偿；MVP 不声称能自动识别所有静默数据丢失。
 - KEYS：`sk:stock:{itemId}`、`sk:compensated:{reservationId}`、`sk:req:{userId}:{key}`
-- 返回码：`OK`、`ALREADY`、`MISS`
+- 返回码：`OK`、`ALREADY`、`MISS`、`BAD_STOCK`
 - 库存键不存在：返回 `MISS`，**不创建库存键、不设置标记**。
+- 库存值不是整数：返回 `BAD_STOCK`，**不设置标记、不 `INCRBY`**；调用方保留 pending 并告警，避免把未完成的回补误记为 `ALREADY`/DONE。
 - 标记已存在：返回 `ALREADY`，不再 `INCRBY`。
 - 否则 `SET marker` → `INCRBY stock qty` → 条件更新请求缓存（仅当缓存 reservationId 匹配且状态不是 SUCCEEDED）。
 - 标记无 TTL；由人工监控内存，不自动清理。
@@ -135,8 +136,9 @@ consumer: worker-{hostname}-{pid}
 ### 5.4 `restock.lua`
 
 - KEYS：`sk:stock:{itemId}`、`sk:restocked:{orderNo}`
-- 返回码：`OK`、`ALREADY`、`MISS`
+- 返回码：`OK`、`ALREADY`、`MISS`、`BAD_STOCK`
 - 库存键不存在：返回 `MISS`，不创建键、不设置标记。
+- 库存值不是整数：返回 `BAD_STOCK`，不设置标记、不 `INCRBY`；调用方记录告警，人工核查。
 - `SET sk:restocked:{orderNo} 1 NX EX 86400` 成功才 `INCRBY stock qty`。
 - 标记只有 24h；过期后不得仅凭“标记不存在”再次回补，见第 6 节。
 

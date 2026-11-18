@@ -142,3 +142,68 @@ func TestLuaContracts(t *testing.T) {
 		_ = g.Client().Del(ctx, keys...).Err()
 	}
 }
+
+func newRedisTestGateway(t *testing.T, prefix string) *Gateway {
+	t.Helper()
+	if os.Getenv("SECKILL_REDIS_IT") != "1" {
+		t.Skip("set SECKILL_REDIS_IT=1 to run redis integration test")
+	}
+	addr := os.Getenv("SECKILL_IT_REDIS")
+	if addr == "" {
+		addr = "127.0.0.1:6379"
+	}
+	rawDB := os.Getenv("SECKILL_IT_REDIS_DB")
+	if rawDB == "" {
+		t.Fatal("SECKILL_IT_REDIS_DB must be set to a dedicated logical DB (for example 14)")
+	}
+	db, err := strconv.Atoi(rawDB)
+	if err != nil || db < 0 {
+		t.Fatalf("invalid SECKILL_IT_REDIS_DB %q", rawDB)
+	}
+	g := New(addr, "", db, prefix, prefix+"stream:orders", "test-workers", time.Hour)
+	t.Cleanup(func() {
+		keys, _ := g.Client().Keys(context.Background(), prefix+"*").Result()
+		if len(keys) > 0 {
+			_ = g.Client().Del(context.Background(), keys...).Err()
+		}
+		g.Close()
+	})
+	return g
+}
+
+// If the stock value is not an integer, INCRBY fails after the marker would be
+// set. The marker must not be created, otherwise a retry reports ALREADY and the
+// worker could record DONE without actually restoring stock.
+func TestCompensatePartialExecutionDoesNotFalselyComplete(t *testing.T) {
+	prefix := fmt.Sprintf("sk:test:partial:%d:", time.Now().UnixNano())
+	g := newRedisTestGateway(t, prefix)
+	ctx := context.Background()
+	itemID := int64(77)
+
+	if err := g.Client().Set(ctx, g.StockKey(itemID), "not-a-number", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, err := g.Compensate(ctx, itemID, 1, "key-partial", "res-partial", 1, "REJECTED")
+	if err == nil && (code == "OK" || code == "ALREADY") {
+		t.Fatalf("partial compensation must not report success: code=%q err=%v", code, err)
+	}
+	if exists, _ := g.Client().Exists(ctx, prefix+"compensated:res-partial").Result(); exists != 0 {
+		t.Fatal("compensation marker must not be set when stock increment cannot succeed")
+	}
+	code2, err2 := g.Compensate(ctx, itemID, 1, "key-partial", "res-partial", 1, "REJECTED")
+	if err2 == nil && (code2 == "OK" || code2 == "ALREADY") {
+		t.Fatalf("retry must not turn a partial failure into ALREADY: code=%q", code2)
+	}
+	if got := g.Client().Get(ctx, g.StockKey(itemID)).Val(); got != "not-a-number" {
+		t.Fatalf("stock value changed unexpectedly: %q", got)
+	}
+
+	code, err = g.Restock(ctx, itemID, "SK-PARTIAL", 1)
+	if err == nil && (code == "OK" || code == "ALREADY") {
+		t.Fatalf("partial restock must not report success: code=%q err=%v", code, err)
+	}
+	if exists, _ := g.Client().Exists(ctx, prefix+"restocked:SK-PARTIAL").Result(); exists != 0 {
+		t.Fatal("restock marker must not be set when stock increment cannot succeed")
+	}
+}

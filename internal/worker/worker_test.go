@@ -35,6 +35,7 @@ type fakeGate struct {
 	compensateCode string
 	compensateErr  error
 	markErr        error
+	lastOrderNo    string
 }
 
 func (f *fakeGate) ReadGroup(ctx context.Context, consumer string, count int64, block time.Duration) ([]redisrepo.Message, error) {
@@ -49,6 +50,7 @@ func (f *fakeGate) Ack(ctx context.Context, messageID string) error {
 }
 func (f *fakeGate) MarkSuccess(ctx context.Context, userID int64, key, reservationID, orderNo string) error {
 	f.marked++
+	f.lastOrderNo = orderNo
 	return f.markErr
 }
 func (f *fakeGate) Compensate(ctx context.Context, itemID int64, userID int64, key, reservationID string, quantity int, reason string) (string, error) {
@@ -91,11 +93,12 @@ func TestProcessPendingCompensatesAndMarksDone(t *testing.T) {
 	}}
 	gate := &fakeGate{}
 	w := New(store, gate, time.Hour)
-	if err := w.Process(context.Background(), testMessage()); err != nil {
-		t.Fatal(err)
-	}
+	w.processAndAck(context.Background(), testMessage(), false)
 	if gate.compensated != 1 || store.doneID != "res-1" {
 		t.Fatalf("compensated=%d done=%q", gate.compensated, store.doneID)
+	}
+	if gate.acked != 1 {
+		t.Fatalf("acked=%d, want 1", gate.acked)
 	}
 }
 
@@ -121,27 +124,81 @@ func TestProcessCompensationMISSKeepsPending(t *testing.T) {
 	}}
 	gate := &fakeGate{compensateCode: "MISS"}
 	w := New(store, gate, time.Hour)
-	if err := w.Process(context.Background(), testMessage()); err == nil {
-		t.Fatal("expected MISS to keep message pending")
-	}
+	w.processAndAck(context.Background(), testMessage(), false)
 	if store.doneID != "" {
 		t.Fatalf("compensation must not be marked DONE: %s", store.doneID)
+	}
+	if gate.acked != 0 {
+		t.Fatalf("MISS must stay pending, acked=%d", gate.acked)
 	}
 }
 
 func TestProcessStoreError(t *testing.T) {
 	store := &fakeStore{err: errors.New("mysql down")}
-	w := New(store, &fakeGate{}, time.Hour)
-	if err := w.Process(context.Background(), testMessage()); err == nil {
-		t.Fatal("expected store error")
+	gate := &fakeGate{}
+	w := New(store, gate, time.Hour)
+	w.processAndAck(context.Background(), testMessage(), false)
+	if gate.acked != 0 {
+		t.Fatal("failed reservation must not be acked")
 	}
 }
 
 func TestProcessUnknownOutcome(t *testing.T) {
 	store := &fakeStore{outcome: mysqlrepo.ReservationOutcome{Kind: "UNKNOWN"}}
-	w := New(store, &fakeGate{}, time.Hour)
-	if err := w.Process(context.Background(), testMessage()); err == nil {
-		t.Fatal("expected unknown outcome error")
+	gate := &fakeGate{}
+	w := New(store, gate, time.Hour)
+	w.processAndAck(context.Background(), testMessage(), false)
+	if gate.acked != 0 {
+		t.Fatal("unknown outcome must stay pending")
+	}
+}
+
+// failOnceHandleStore simulates an ambiguous commit: the reservation is
+// processed, but the worker cannot confirm it on the first attempt. The retry
+// observes the durable result and must not create a second order or compensate.
+type failOnceHandleStore struct {
+	outcome mysqlrepo.ReservationOutcome
+	calls   int
+}
+
+func (s *failOnceHandleStore) HandleReservation(context.Context, mysqlrepo.ReservationInput) (mysqlrepo.ReservationOutcome, error) {
+	s.calls++
+	if s.calls == 1 {
+		return mysqlrepo.ReservationOutcome{}, errors.New("commit result unknown")
+	}
+	return s.outcome, nil
+}
+func (s *failOnceHandleStore) MarkCompensationDone(context.Context, string) error { return nil }
+
+func TestProcessUnknownCommitKeepsPendingThenUniqueResult(t *testing.T) {
+	store := &failOnceHandleStore{outcome: mysqlrepo.ReservationOutcome{
+		Kind: "SUCCESS", Order: &model.Order{OrderNo: "SK1"},
+	}}
+	gate := &fakeGate{}
+	w := New(store, gate, time.Hour)
+
+	// First delivery: commit result is unknown. Do not ACK or compensate.
+	w.processAndAck(context.Background(), testMessage(), false)
+	if gate.acked != 0 {
+		t.Fatal("unknown commit result must not be acked")
+	}
+	if gate.compensated != 0 {
+		t.Fatal("unknown commit result must not trigger compensation")
+	}
+
+	// Retry: the same reservation returns the durable order; ACK exactly once.
+	w.processAndAck(context.Background(), testMessage(), false)
+	if gate.acked != 1 {
+		t.Fatalf("acked=%d, want 1 after recovery", gate.acked)
+	}
+	if gate.compensated != 0 {
+		t.Fatal("recovered reservation must not be compensated")
+	}
+	if gate.marked != 1 || gate.lastOrderNo != "SK1" {
+		t.Fatalf("marked=%d orderNo=%q, want one SK1 mark", gate.marked, gate.lastOrderNo)
+	}
+	if store.calls != 2 {
+		t.Fatalf("handle calls=%d, want 2", store.calls)
 	}
 }
 
@@ -153,11 +210,12 @@ func TestProcessCompensationErrorKeepsPending(t *testing.T) {
 	}}
 	gate := &fakeGate{compensateErr: errors.New("lua error")}
 	w := New(store, gate, time.Hour)
-	if err := w.Process(context.Background(), testMessage()); err == nil {
-		t.Fatal("expected compensation error")
-	}
+	w.processAndAck(context.Background(), testMessage(), false)
 	if store.doneID != "" {
 		t.Fatalf("compensation error must not mark DONE: %s", store.doneID)
+	}
+	if gate.compensated != 1 {
+		t.Fatalf("compensated=%d, want 1 attempt", gate.compensated)
 	}
 	if gate.acked != 0 {
 		t.Fatalf("failed compensation must not be acked")

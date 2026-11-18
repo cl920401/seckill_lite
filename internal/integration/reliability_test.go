@@ -651,3 +651,110 @@ func TestPayCancelRaceOnlyOneWins(t *testing.T) {
 		t.Fatalf("unexpected terminal status %q", final.Status)
 	}
 }
+
+// TestCompensationPartialExecutionDoesNotMarkDone ensures a compensation whose
+// INCRBY cannot succeed (invalid stock value) does not leave a marker that a
+// retry would treat as ALREADY and record DONE.
+func TestCompensationPartialExecutionDoesNotMarkDone(t *testing.T) {
+	store, gate := setup(t, time.Hour)
+	item := createItem(t, store, gate, 10, 1)
+	ctx := context.Background()
+	req := reserveOne(t, gate, item, 7060, fmt.Sprintf("partial-%d", time.Now().UnixNano()), 3)
+	out, err := store.HandleReservation(ctx, mysqlrepo.ReservationInput{
+		ReservationID: req.ReservationID, UserID: req.UserID, IdempotencyKey: req.Key,
+		ItemID: req.ItemID, Quantity: req.Quantity, PayloadHash: req.PayloadHash,
+	})
+	if err != nil || out.Order != nil || !out.Compensate {
+		t.Fatalf("expected rejected reservation: %+v %v", out, err)
+	}
+	if err := gate.Client().Set(ctx, gate.StockKey(item.ID), "not-a-number", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	wk := worker.New(store, gate, time.Hour)
+	msg := redisrepo.Message{
+		ID: "partial-msg", ReservationID: req.ReservationID, IdempotencyKey: req.Key,
+		UserID: req.UserID, ItemID: req.ItemID, Quantity: req.Quantity, PayloadHash: req.PayloadHash,
+	}
+	if err := wk.Process(ctx, msg); err == nil {
+		t.Fatal("expected BAD_STOCK compensation failure")
+	}
+	rr, err := store.GetReservationResult(ctx, req.ReservationID)
+	if err != nil || rr.CompensationState != "PENDING" {
+		t.Fatalf("reservation state=%+v err=%v, want PENDING", rr, err)
+	}
+	if err := wk.Process(ctx, msg); err == nil {
+		t.Fatal("retry must not be treated as ALREADY")
+	}
+	rr, err = store.GetReservationResult(ctx, req.ReservationID)
+	if err != nil || rr.CompensationState != "PENDING" {
+		t.Fatalf("retry marked DONE without restoring stock: %+v err=%v", rr, err)
+	}
+	if exists, _ := gate.Client().Exists(ctx, gate.Prefix()+"compensated:"+req.ReservationID).Result(); exists != 0 {
+		t.Fatal("compensation marker must not exist after partial execution")
+	}
+}
+
+// failOnceAfterHandleStore delegates to the real store (so the order commits)
+// but reports the first result as unknown, simulating a lost commit response.
+type failOnceAfterHandleStore struct {
+	*mysqlrepo.Store
+	calls int
+}
+
+func (s *failOnceAfterHandleStore) HandleReservation(ctx context.Context, in mysqlrepo.ReservationInput) (mysqlrepo.ReservationOutcome, error) {
+	s.calls++
+	out, err := s.Store.HandleReservation(ctx, in)
+	if s.calls == 1 {
+		return mysqlrepo.ReservationOutcome{}, errors.New("simulated unknown commit result")
+	}
+	return out, err
+}
+
+// TestUnknownCommitResultRecoversUnique verifies SPEC 7.2: an unknown commit
+// must not be compensated or treated as failed; retry observes the durable
+// order and does not create a second one or increase Redis stock.
+func TestUnknownCommitResultRecoversUnique(t *testing.T) {
+	store, gate := setup(t, time.Hour)
+	item := createItem(t, store, gate, 1, 1)
+	ctx := context.Background()
+	req := reserveOne(t, gate, item, 7061, fmt.Sprintf("unknown-%d", time.Now().UnixNano()), 1)
+	wrapped := &failOnceAfterHandleStore{Store: store}
+	wk := worker.New(wrapped, gate, time.Hour)
+	msg := redisrepo.Message{
+		ID: "unknown-msg", ReservationID: req.ReservationID, IdempotencyKey: req.Key,
+		UserID: req.UserID, ItemID: req.ItemID, Quantity: req.Quantity, PayloadHash: req.PayloadHash,
+	}
+
+	if err := wk.Process(ctx, msg); err == nil {
+		t.Fatal("expected unknown commit result to keep pending")
+	}
+	if wrapped.calls != 1 {
+		t.Fatalf("handle calls=%d, want 1", wrapped.calls)
+	}
+	count, err := store.CountOrdersByItem(ctx, item.ID)
+	if err != nil || count != 1 {
+		t.Fatalf("committed order must persist: count=%d err=%v", count, err)
+	}
+	if stock, _, err := gate.GetStock(ctx, item.ID); err != nil || stock != 0 {
+		t.Fatalf("redis stock=%d err=%v, want 0 (no blind restock)", stock, err)
+	}
+
+	if err := wk.Process(ctx, msg); err != nil {
+		t.Fatalf("retry after recovery: %v", err)
+	}
+	if wrapped.calls != 2 {
+		t.Fatalf("handle calls=%d, want 2", wrapped.calls)
+	}
+	count, err = store.CountOrdersByItem(ctx, item.ID)
+	if err != nil || count != 1 {
+		t.Fatalf("retry must not create a second order: count=%d err=%v", count, err)
+	}
+	if stock, _, err := gate.GetStock(ctx, item.ID); err != nil || stock != 0 {
+		t.Fatalf("retry restocked redis: stock=%d err=%v", stock, err)
+	}
+	order, reqResult, err := store.LookupRequest(ctx, req.UserID, req.Key)
+	if err != nil || order == nil || reqResult == nil || reqResult.State != "SUCCEEDED" {
+		t.Fatalf("durable result: order=%+v request=%+v err=%v", order, reqResult, err)
+	}
+}
