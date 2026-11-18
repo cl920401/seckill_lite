@@ -124,22 +124,24 @@ UPDATE seckill_items
 
 ### 4.3 限购
 
-推荐先更新、再插入，避免 `ON DUPLICATE KEY UPDATE` 无条件累加导致超限：
+先确保计数行以 `qty=0` 存在，再对首次及后续购买统一执行限购条件更新；不得在 UPDATE 影响 0 行后直接插入购买数量：
 
 ```sql
+INSERT INTO user_purchases (item_id, user_id, qty)
+VALUES (?, ?, 0)
+ON DUPLICATE KEY UPDATE id = id;
+
 UPDATE user_purchases
    SET qty = qty + ?
  WHERE item_id = ? AND user_id = ? AND qty + ? <= ?;
-
--- 若影响 0 行，尝试：
-INSERT INTO user_purchases (item_id, user_id, qty)
-VALUES (?, ?, ?);
--- 若 1062 冲突，重新取得行锁后再执行上面的 UPDATE 一次；
--- 仍不满足则判定 LIMIT_EXCEEDED。
+-- quantity 必须为正整数；最后一个参数为该商品的 per_user_limit。
+-- UPDATE 影响 0 行即 LIMIT_EXCEEDED；不能改走无条件插入/累加。
 ```
 
-- 必须在事务内、持有 `request_results` 行锁后执行。
-- 限购失败：`ROLLBACK TO SAVEPOINT` 撤销库存/限购变更，保持请求行锁，写 `request_results REJECTED` 后提交。
+- 必须在事务内、持有 `request_results` 行锁后执行。`user_purchases(item_id,user_id)` 唯一行上的写锁使不同幂等键的并发购买也串行检查限购。
+- SAVEPOINT 在请求行锁取得后、库存扣减与计数建行之前建立。限购失败时 `ROLLBACK TO SAVEPOINT` 撤销库存/限购变更，保留请求行锁，再写 `request_results REJECTED` 与预约补偿终态后提交。
+- 验收至少覆盖：首次 quantity 大于 limit 被拒绝、首次恰好达到 limit 成功、后续超限被拒绝、同用户不同键并发总量不超过 limit。
+
 - 取消订单时递减 `qty`，保留行，不删除。
 
 ### 4.4 建单与流水
@@ -205,3 +207,4 @@ COMMIT
 - 执行迁移、写库、清库、压测前必须获得用户明确确认。
 - 不修改已有迁移；变更追加新编号。
 - 表结构变更必须同步 `docs/SPEC.md` 第 8 节与本文档。
+

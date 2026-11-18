@@ -123,6 +123,8 @@ consumer: worker-{hostname}-{pid}
 
 ### 5.3 `compensate.lua`
 
+- 调用前必须读持久预约终态：只有 outcome 为 REJECTED / EXTRA_RESERVATION 且 compensation_state=PENDING 才可补偿；DONE 直接 ACK，不因 Redis 标记缺失再次回补。同一成功预约也不补偿。
+- 正常首次补偿没有 marker 是预期情况，不等于 Redis 数据丢失。若已知/已检测到 Redis 数据丢失或人工重置，则先暂停相关处理并人工核查，不直接重放 PENDING 补偿；MVP 不声称能自动识别所有静默数据丢失。
 - KEYS：`sk:stock:{itemId}`、`sk:compensated:{reservationId}`、`sk:req:{userId}:{key}`
 - 返回码：`OK`、`ALREADY`、`MISS`
 - 库存键不存在：返回 `MISS`，**不创建库存键、不设置标记**。
@@ -171,6 +173,9 @@ consumer: worker-{hostname}-{pid}
 | Redis 不可用 | 新单 503；历史结果在本地有界保护下回源 MySQL；查询可降级 |
 | Redis 数据丢失 | 可能丢失未落库预约、幂等状态、Stream、补偿标记；人工核查，不自动重建 |
 | Stream 满 | 429 `QUEUE_FULL`，不扣库存；人工清理 |
-| 补偿标记缺失 | 视为结果不明，保留 pending、暂停、告警；不得盲目补偿 |
+| 正常首次补偿，marker 尚不存在 | DB 拒绝/额外预约终态已提交且补偿 PENDING，按 compensate.lua 原子执行；不能仅凭 marker 缺失判定数据丢失 |
+| DB 补偿已 DONE，marker 不存在 | 直接 ACK，不再回补 |
+| 已知/检测到 Redis 数据丢失或人工重置，补偿仍 PENDING | 暂停相关处理、保留消息、告警并人工核查；不能按普通首次补偿重放 |
 
 不声称实现自动对账、自动库存修复、自动 Redis 重建或完整高可用。
+

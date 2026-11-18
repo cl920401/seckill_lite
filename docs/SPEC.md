@@ -32,7 +32,7 @@
 4. **模拟支付**：待支付订单可被模拟支付回调置为已支付；支付回调幂等；不做真实退款。
 5. **超时取消与库存回补**：待支付订单超时后取消，MySQL 与 Redis 库存各回补一次；取消逻辑可重复执行而不重复回补。
 6. **最小故障语义**：
-   - Redis 或 MySQL 不可用时，新订单快速失败，绝不绕过 Redis 直接写库下单；
+   - 已识别 Redis 或 MySQL 不可用时，新订单快速失败，绝不绕过 Redis 直接写库下单；健康检查不是跨系统原子屏障，检查后才发生故障的预约按结果不明/已受理语义处理；
    - 已受理但结果不明的请求保留消息，可用同一幂等键查询/重试；
    - 任何情况下都不因“超时”或“查不到订单”自动回补库存。
 7. **可测试**：并发不超卖、幂等、超时取消回补一次、Worker 重启消息重试、依赖不可用行为均有自动化或可重复脚本验证。
@@ -134,7 +134,7 @@ MySQL（唯一事实来源）
    - 历史结果不因活动结束、库存耗尽或 Redis 故障而失效。
    - 幂等回放不消耗每用户新单限额，但仍消耗全局限流，且查询本身受全局限流保护；不得无限制查库。
 4. **仅确认是新购买意图时**，执行每用户限流 `sk:rl:user:{userID}`；超限返回 `429 RATE_LIMITED`，不扣库存。50 个同键请求同时到达时，部分请求可能因全局限流或该用户限流被 429；未被限流的请求不得重复建单。
-5. 校验活动/商品是否存在、活动时间窗及数量限制，并检查 Redis/MySQL 依赖；任一不可用或熔断均返回 `503 SERVICE_UNAVAILABLE`，不进入 Lua、不写库。
+5. 校验活动/商品是否存在、活动时间窗及数量限制，并检查 Redis/MySQL 依赖；任一已确认不可用或熔断均返回 `503 SERVICE_UNAVAILABLE`，不进入 Lua、不写库。检查通过后依赖仍可能故障；Lua 已执行或执行结果不明时不能撤销受理事实，按原幂等键查询最终结果。
 6. 执行一个 Redis Lua 脚本，原子完成：
    - 读取 `sk:req:{userID}:{idempotencyKey}`：
      - 已存在且 payload 指纹一致 → 返回已有状态（`PROCESSING` / `SUCCEEDED` / `REJECTED`）；
@@ -171,7 +171,7 @@ reservationId, idempotencyKey, userId, itemId, quantity, payloadHash, acceptedAt
    - 首次处理写入指纹；不同指纹不能覆盖已有请求结果，只终结本次多余预约。
    - 查已有订单/请求终态：同一 winning_reservation_id 且已成功，仅回填结果并 ACK，不回补；不同 reservationId 的额外预扣进入一次性补偿流程。
    - 已为 REJECTED 的业务键不得再建单。此前回滚未产生终态的事务可安全重试。
-3. 尚无终态时，在同一事务内条件扣库存、锁定限购计数并校验、插入订单及 DEDUCT 流水，写请求 SUCCEEDED 及 winning_reservation_id，再提交。订单保存 reservation_id，保留 UNIQUE(user_id, idempotency_key)。
+3. 尚无终态时，在同一事务内条件扣库存、先确保 user_purchases 以 qty=0 建行再统一执行带限购条件的 UPDATE（首次购买不得直接插入 quantity）、插入订单及 DEDUCT 流水，写请求 SUCCEEDED 及 winning_reservation_id，再提交。订单保存 reservation_id，保留 UNIQUE(user_id, idempotency_key)。
    - 库存或限购确定拒绝时回滚业务变更；保持同一请求行锁至拒绝终态提交，可用事务内 SAVEPOINT 回滚库存/计数操作，再写 REJECTED 与原因。不得释放锁后无条件覆盖另一 Worker 的成功结果。
    - MySQL 连接/提交结果不明：不补偿、不 ACK。重新取得请求行锁后读取持久结果；无法确认则保留 Pending 并告警。
 4. 为需要回补的具体预约，在上述受锁事务内写 `reservation_results(reservation_id UNIQUE, user_id, idempotency_key, payload_hash, outcome, compensation_state)`，outcome 为 REJECTED 或 EXTRA_RESERVATION。它是禁止该预约以后建单的持久终态。业务键的成功结果不被额外预约覆盖。
@@ -424,7 +424,7 @@ if SET sk:restocked:{orderNo} 1 NX EX 86400 then
 end
 ```
 
-Worker 仅对持久终态为 REJECTED 或 EXTRA_RESERVATION 且补偿未完成的预约执行回补；同一成功预约重投不回补。补偿 Lua 使用 `sk:compensated:{reservationId}` 去重，原子完成检查库存键存在、SET NX 标记、INCRBY 和条件更新请求缓存（仅当缓存仍属于该 reservationId）。库存键缺失时不创建键、不设置标记，返回 MISS。补偿标记 `sk:compensated` 在 MVP 中不设 TTL、不主动清理，以覆盖“Redis 已补偿但 DB DONE 尚未记录”的任意长重试窗口；自动清理不在本轮范围。Redis 数据丢失后的恢复必须走人工核查，不能盲目重放补偿。
+Worker 仅对持久终态为 REJECTED 或 EXTRA_RESERVATION 且补偿未完成的预约执行回补；同一成功预约重投不回补。DB compensation_state=DONE 时直接 ACK，不能因 Redis marker 缺失再次补偿；正常首次补偿的 marker 不存在是预期情况，不是数据丢失证据。已知/已检测到 Redis 数据丢失或人工重置时，PENDING 补偿须先暂停并人工核查；MVP 不承诺自动检测所有静默丢失。补偿 Lua 使用 `sk:compensated:{reservationId}` 去重，原子完成检查库存键存在、SET NX 标记、INCRBY 和条件更新请求缓存（仅当缓存仍属于该 reservationId）。库存键缺失时不创建键、不设置标记，返回 MISS。补偿标记 `sk:compensated` 在 MVP 中不设 TTL、不主动清理，以覆盖“Redis 已补偿但 DB DONE 尚未记录”的任意长重试窗口；自动清理不在本轮范围。Redis 数据丢失后的恢复必须走人工核查，不能盲目重放补偿。
 
 限制：Redis 数据丢失会同时丢失标记与库存键，极端情况下可能重复回补或库存键缺失；MySQL 条件更新仍阻止超卖，但可能造成 Redis 少卖/多放行。MVP 不自动修复，需人工核查。
 
@@ -455,7 +455,8 @@ Worker 仅对持久终态为 REJECTED 或 EXTRA_RESERVATION 且补偿未完成�
 |---|---|---|---|---|
 | Redis 不可用 | `503`，不写 MySQL | Stream 消息与状态保留在 Redis（若未丢），Worker 无法拉取 | 有 DB 订单可查；否则 `503` | 恢复 Redis 后 Worker 继续；不自动重建/对账 |
 | Redis 数据丢失 | 库存键缺失 → `503`，不自动初始化 | 可能丢失预约、幂等状态；DB 订单仍可查 | DB 有订单返回订单；否则 `RESULT_UNKNOWN` | 暂停入口，人工按 DB 重建活跃库存键并核查 |
-| MySQL 不可用 | 健康检查/熔断 → `503`，不扣 Redis | 消息保留，Worker 不 ACK、退避重试 | 返回 `503` | 恢复后重试；不绕过 Redis 直写 |
+| MySQL 故障已在预扣前识别 | 健康检查/熔断 → `503`，不执行 Lua、不扣 Redis | 既有消息保留，Worker 不 ACK、退避重试 | 返回 `503` | 恢复后重试；不绕过 Redis 直写 |
+| MySQL 在检查通过/Redis 预扣后故障 | 已执行或结果不明的 Lua 不能视为未受理；明确已入队可返回 202，无法确认返回503并提示原键查询 | 消息保留；恢复后可能正常落单，不自动判失败/回补 | 依赖不可用返回503，不代表预约失败 | 恢复后按原幂等键查询/消费，DB终态为准 |
 | Worker 崩溃 | 入口仍可受理（依赖正常） | pending 消息由 `XAUTOCLAIM` 接管 | 可能短暂 `202` | 重启 Worker 自动重试（至少一次） |
 | 取消调度崩溃 | 不影响 | 订单保持待支付 | 正常 | 重启后重新扫描；条件更新防重复 |
 | 支付回调丢失 | 不影响 | 订单保持待支付，可能超时取消 | 用户可重试同一模拟支付 | 无自动对账 |
@@ -604,6 +605,8 @@ Worker 仅对持久终态为 REJECTED 或 EXTRA_RESERVATION 且补偿未完成�
 - 幂等回放不消耗 `sk:rl:user:{userID}` 新单令牌，但仍消耗全局限流；不能承诺所有并发重试都返回 202/200。
 - 重启时保留尚未落库预约：不得用 DB available 覆盖 Redis 预扣后的库存。
 
+- 限购补充：首次购买 quantity > per_user_limit 拒绝；首次等于上限成功；后续或不同键并发购买不得使累计数量超过上限。
+
 ### A3 订单超时取消回补一次
 
 - 创建订单并使其过期（测试配置缩短 TTL）。
@@ -623,14 +626,18 @@ Worker 仅对持久终态为 REJECTED 或 EXTRA_RESERVATION 且补偿未完成�
   - 消息最终被处理，订单只创建一次；
   - 若“已提交但未 XACK”，同预约重投不新增订单，Redis 库存也不得增加；
   - 确定拒绝后补偿成功、ACK前崩溃：重投仍拒绝，不建单、不再次回补；
-  - 补偿成功、DB DONE写入前崩溃：重复Lua命中标记，完成DONE后ACK；
+  - 正常首次补偿 marker 不存在：持久拒绝终态及 PENDING 确认后允许补偿；
+  - 补偿成功、DB DONE写入前崩溃且 Redis 未丢数据：重复Lua命中标记，完成DONE后ACK；
+  - DB DONE后删除marker再重投：只ACK，不再次回补；
+  - 已知Redis丢失/重置且补偿PENDING：暂停并人工核查，不按首次补偿自动执行；
   - 拒绝/补偿处理中被XAUTOCLAIM并发认领：持久终态阻止旧Worker重新建单；
   - 不因重启丢失已受理请求（前提：Redis 未丢数据）。
 
 ### A5 依赖不可用时的新订单行为
 
 - **Redis 停止**：新下单请求在超时内返回 `503 SERVICE_UNAVAILABLE`；MySQL 订单数不增加；不存在绕过 Redis 的直接写库路径。
-- **MySQL 停止**：新下单请求快速返回 `503`；Redis 库存不被扣减（或已扣减的请求保持未受理状态，不产生订单）；不绕过 Redis 写库。
+- **MySQL 故障在预扣前已识别**：先停止 MySQL 并等待健康检查/熔断确认，再发送新请求；快速返回503，不执行预扣Lua、不新增Stream消息、不扣Redis库存，不绕过Redis写库。
+- **检查通过后发生 MySQL 故障**：用测试钩子在依赖检查通过、Lua入队完成后停止MySQL；预约保持已受理，Worker保留消息，不因查不到订单自动回补。若响应无法确认则503只表示本次无法确认，不能据此断言“未受理/永不产生订单”。恢复MySQL后，同键查询得到唯一订单或持久拒绝结果；同预约重投不重复扣减/回补。
 - **结果不明**：构造已受理、Worker 未处理/Redis 状态丢失场景，按幂等键查询返回 `202` 或 `409 RESULT_UNKNOWN`，不得返回“失败”并自动回补；告警产生。
 - **Redis 恢复后**：pending 消息可继续消费；不声称自动修复库存差异。
 
@@ -745,4 +752,5 @@ Worker 仅对持久终态为 REJECTED 或 EXTRA_RESERVATION 且补偿未完成�
 > - 活动未开始、已结束、库存不足时，接口返回明确的业务错误，而不是 500。
 > - 单元测试覆盖并发扣减与幂等两类场景。
 > - 服务重启后数据仍然正确，不依赖内存状态。
+
 
