@@ -1,6 +1,6 @@
 # HTTP API 设计
 
-状态：MVP 设计，待实现  
+状态：MVP 已实现，详细行为以实现为准；集成测试已使用独立 seckill_test 库验证
 事实来源：`docs/SPEC.md`。本文档是接口细节展开；与 SPEC 冲突时先修 SPEC，再同步本文档。
 
 ---

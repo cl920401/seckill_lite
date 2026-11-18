@@ -1,6 +1,6 @@
 # Redis Key 与 Stream 设计
 
-状态：MVP 设计，待实现  
+状态：MVP 已实现；Redis 集成测试需显式开启
 事实来源：`docs/SPEC.md`；与本文档冲突时先修 SPEC。
 
 ---

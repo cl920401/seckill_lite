@@ -1,7 +1,7 @@
 # 数据库结构设计
 
-状态：MVP 设计，待实现  
-DDL：`migrations/0001_init.sql`（仅设计产物，尚未执行）  
+状态：MVP 已实现；运行库 DDL 未执行，seckill_test 测试库已执行
+DDL：`migrations/0001_init.sql`（运行库尚未执行）
 事实来源：`docs/SPEC.md`；与本文档冲突时先修 SPEC。
 
 ---
