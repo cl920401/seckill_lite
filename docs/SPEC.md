@@ -12,7 +12,7 @@
 - 仓库当前只有 `go.mod` 与仅含标题的 `README.md`，没有已存在的 API 文档或 DDL，因此不存在需要迁移或改写的旧接口/表结构。
 - 此前对话中的“同步下单”方案被本 SPEC 取代：本 MVP 使用 **Redis Stream 异步受理**，入口返回 `202`，订单由 Worker 落库。
 - README 只补充项目说明和本文档链接，不删除原有内容。
-- 原题完整保留在附录 A，未删除项目文件或已有数据。
+- 附录 A 保留项目一的功能与验收要求；原任务说明的交付要求另列于第 11.1 节，不将摘录称为完整原题。
 - 本轮只写文档，不写业务代码，不执行任何数据库操作；DDL 在实现阶段新增迁移文件。
 
 ---
@@ -103,7 +103,7 @@ MySQL（唯一事实来源）
 
 ### 3.2 为什么用异步
 
-入口只做 O(1) 的 Redis Lua 操作并投递消息，避免把入口并发直接放大到 MySQL；Worker 按可控并发消费。代价是接口从“同步成功”变为“202 受理 + 轮询结果”，客户端必须理解该语义。
+入口执行 Redis Lua 操作并投递消息；幂等 miss 回源 DB 会增加点查读流量，不能宣称完全不访问 MySQL。Worker 按可控并发消费，隔离的是建单写事务并发。代价是接口从“同步成功”变为“202 受理 + 轮询结果”，客户端必须理解该语义。
 
 ---
 
@@ -117,7 +117,7 @@ MySQL（唯一事实来源）
    - `sk:stock:{itemID}` = `available_stock`
    - 活动/商品快照缓存（TTL 短，例如 5～10 秒）
 4. 若 Redis 写入失败：接口返回“活动已创建但未就绪”的业务状态；在库存键存在前，该商品的下单请求一律 `503 SERVICE_UNAVAILABLE`，不自动猜测库存。
-5. 服务启动时仅对活跃活动做一次“按 MySQL 加载库存键”的预加载；这是启动预热，不是运行期自动对账或自动重建。库存键缺失时下单快速失败并告警。
+5. 正常重启保留已有 Redis 库存，不从 MySQL 覆盖，也不因键缺失自动补建。仅新建、尚未开放且从未受理预约的商品，可用 SET NX 初始化库存。已有活动库存键缺失时保持未就绪，返回 503 并告警；按 7.3 停止入口和 Worker、核清在途预约及迟到回补后人工恢复。启动不能把尚未落库的预扣重新放行。
 
 ### 4.2 抢购下单（入口）
 
@@ -125,8 +125,8 @@ MySQL（唯一事实来源）
 
 1. 校验 `Idempotency-Key`：必填、长度 8～128、字符集受限、按用户隔离。
 2. 限流检查：每用户 + 全局；超限返回 `429 RATE_LIMITED`，不扣 Redis 库存。
-3. 校验活动/商品：存在、活动已开始、未结束、数量合法。
-4. 依赖检查：Redis 与 MySQL 均不可用或熔断时返回 `503 SERVICE_UNAVAILABLE`，不进入 Lua、不写库。
+3. 校验 payload 基本格式并生成指纹，先查 Redis 幂等；命中时校验指纹。Redis miss 或不可用时按 `(user_id, idempotency_key)` 回查 MySQL 订单及请求终态：同指纹返回历史结果，不同指纹返回 `IDEMPOTENCY_CONFLICT`。DB 查询失败返回 503，不进入预扣。历史结果不因活动结束、库存耗尽或 Redis 故障而失效。
+4. 仅不存在历史结果时校验活动/商品是否存在、活动时间窗及数量限制，并检查 Redis/MySQL 依赖；任一不可用或熔断均返回 `503 SERVICE_UNAVAILABLE`，不进入 Lua、不写库。
 5. 执行一个 Redis Lua 脚本，原子完成：
    - 读取 `sk:req:{userID}:{idempotencyKey}`：
      - 已存在且 payload 指纹一致 → 返回已有状态（`PROCESSING` / `SUCCEEDED` / `REJECTED`）；
@@ -134,6 +134,7 @@ MySQL（唯一事实来源）
    - 读取库存键：
      - 库存键不存在 → 返回“未就绪”，接口 `503`，不初始化、不扣减；
      - 库存不足 → 返回 `SOLD_OUT`；
+   - 检查 `XLEN sk:stream:orders < STREAM_MAX_ENTRIES`（默认 10000）；超过返回 `429 QUEUE_FULL`，不扣库存。检查与 XADD 在同一 Lua 内；此上限包含已 ACK 记录，不冒充未完成消息数。
    - `DECRBY` 库存；
    - `XADD sk:stream:orders` 写入预约消息；
    - `SET sk:req:{...}` = `PROCESSING`，保存 payload 指纹、时间，TTL 覆盖最大处理与查询窗口（例如 24 小时）；
@@ -148,51 +149,40 @@ MySQL（唯一事实来源）
 
 ### 4.3 Worker 落库
 
-每条 Stream 消息字段至少包含：
+每次实际预扣生成唯一 `reservationId`，写入 Stream 和请求状态。一次消息重投保持原 reservationId；另一次实际预扣必须使用新值。每条 Stream 消息字段至少包含：
 
 ```text
-idempotencyKey, userId, itemId, quantity, payloadHash, acceptedAt
+reservationId, idempotencyKey, userId, itemId, quantity, payloadHash, acceptedAt
 ```
 
 处理步骤：
 
 1. `XREADGROUP GROUP order-workers CONSUMER worker-{instance} COUNT n BLOCK ms STREAMS sk:stream:orders >`
-2. 开启 MySQL 事务：
-   1. 按 `(user_id, idempotency_key)` 查订单：
-      - 已存在且 payload 一致 → 视为重复消息；补偿本条消息对应的 Redis 预扣（按 Stream message ID 记一次性补偿标记），`XACK`，不重复扣 DB 库存；
-      - 已存在但 payload 冲突 → 不写库、不覆盖；标记 `IDEMPOTENCY_CONFLICT` 并告警，`XACK` 该消息，查询该幂等键返回冲突语义。
-   2. 条件扣库存：
-      ```sql
-      UPDATE seckill_items
-         SET available_stock = available_stock - ?, version = version + 1
-       WHERE id = ? AND available_stock >= ?
-      ```
-      影响行数为 0 → 视为售罄，回滚事务。
-   3. 限购：在事务内以行锁/条件更新保证 `user_purchases.qty + quantity <= per_user_limit`；不满足则回滚。
-   4. 插入订单：`status = PENDING_PAYMENT`、`expire_at = now + TTL`；依赖 `UNIQUE(user_id, idempotency_key)` 兜底幂等。
-   5. 写库存流水（`DEDUCT`）与必要的审计字段。
-   6. 提交事务。
-3. 提交成功后：
-   - 更新 Redis 幂等状态为 `SUCCEEDED`（尽力而为；失败不影响订单查询，因为 DB 可按幂等键回查）；
-   - `XACK` 消息。
-4. 提交失败：
-   - 不 `XACK`，消息留在 pending，按退避重试；
-   - 瞬时错误（连接、死锁、超时）持续重试；
-   - 达到告警阈值仍无法确认时，暂停该消息处理并告警，等待人工核查；不能把“未确认”当成失败回补库存。
-5. 售罄/限购拒绝：
-   - 回滚事务（DB 库存不变）；
-   - 尽力将 Redis 幂等状态置为 `REJECTED` 并记录原因；
-   - 对入口已预扣的 Redis 库存做“带标记的一次性回补”（见 6.4）；
-   - `XACK` 消息。
-6. Worker 启动或周期性执行 `XAUTOCLAIM`，接管空闲超过阈值（例如 60 秒）的 pending 消息；重复消息由 DB 唯一键与订单回查保证幂等。
+2. 开启 MySQL 事务，所有 Worker 对同一业务键先锁定持久请求行：
+   - `request_results` 使用 `UNIQUE(user_id, idempotency_key)`，以 INSERT IGNORE + SELECT FOR UPDATE 建行并锁行；保存 payload_hash、winning_reservation_id、state、reason、order_no。
+   - 首次处理写入指纹；不同指纹不能覆盖已有请求结果，只终结本次多余预约。
+   - 查已有订单/请求终态：同一 winning_reservation_id 且已成功，仅回填结果并 ACK，不回补；不同 reservationId 的额外预扣进入一次性补偿流程。
+   - 已为 REJECTED 的业务键不得再建单。此前回滚未产生终态的事务可安全重试。
+3. 尚无终态时，在同一事务内条件扣库存、锁定限购计数并校验、插入订单及 DEDUCT 流水，写请求 SUCCEEDED 及 winning_reservation_id，再提交。订单保存 reservation_id，保留 UNIQUE(user_id, idempotency_key)。
+   - 库存或限购确定拒绝时回滚业务变更；保持同一请求行锁至拒绝终态提交，可用事务内 SAVEPOINT 回滚库存/计数操作，再写 REJECTED 与原因。不得释放锁后无条件覆盖另一 Worker 的成功结果。
+   - MySQL 连接/提交结果不明：不补偿、不 ACK。重新取得请求行锁后读取持久结果；无法确认则保留 Pending 并告警。
+4. 为需要回补的具体预约，在上述受锁事务内写 `reservation_results(reservation_id UNIQUE, user_id, idempotency_key, payload_hash, outcome, compensation_state)`，outcome 为 REJECTED 或 EXTRA_RESERVATION。它是禁止该预约以后建单的持久终态。业务键的成功结果不被额外预约覆盖。
+5. 事务提交后处理 Redis：
+   - 成功预约：尽力回填 SUCCEEDED；同预约重投不回补，随后 ACK。
+   - 确定拒绝/额外预约：执行 6.4 的补偿 Lua；成功或已执行后，持久更新 compensation_state=DONE，再 ACK。
+   - 补偿失败、库存键缺失或结果不明：保留 Pending，不能 ACK 后遗忘；按退避重试/告警。
+   - 重投先查持久预约终态；已终结预约只能继续补偿或 ACK，绝不能回到建单流程。DONE 后重投直接 ACK，不再调用补偿。
+6. Worker 启动或周期性执行 XAUTOCLAIM 接管 Pending。即使旧 Worker 与认领 Worker 同时运行，请求行锁和持久终态也使建单/拒绝串行。Redis 去重标记不是建单终态的唯一依据。
+
+请求 REJECTED 为该业务键的稳定终态；用户发起新的购买意图须换幂等键。仅暂时无法确认结果的请求使用原键查询/重试，不自动换键。持久请求和预约终态在本 MVP 中不清理。
 
 ### 4.4 查询
 
 - 按订单号：只读 MySQL；订单不存在返回 `404 ORDER_NOT_FOUND`。
 - 按用户：只读 MySQL，分页。
 - 按幂等键（受理结果查询）：
-  1. 先查 MySQL 订单 `(user_id, idempotency_key)`；
-  2. 若存在 → `200` + 订单状态；
+  1. 先查 MySQL 订单及 `request_results` `(user_id, idempotency_key)`；
+  2. 若有订单 → `200` + 订单状态；持久请求为 REJECTED → `200` + REJECTED 与原因；
   3. 不存在 → 查 Redis `sk:req:{...}`：
      - `PROCESSING` → `202` + 建议轮询间隔；
      - `REJECTED` → `200` + `status: REJECTED` + 原因；
@@ -317,6 +307,7 @@ Content-Type: application/json
 | 409 | `RESULT_UNKNOWN` | 受理结果无法确认；禁止据此回补 |
 | 409 | `PAY_AFTER_CANCEL` | 已取消订单收到支付 |
 | 429 | `RATE_LIMITED` | 触发限流 |
+| 429 | `QUEUE_FULL` | Stream条目达到容量上限，未受理 |
 | 503 | `SERVICE_UNAVAILABLE` | Redis/MySQL 不可用、库存未就绪、熔断 |
 | 503 | `NOT_READY` | 库存键未预热完成 |
 
@@ -371,10 +362,10 @@ Stream：
 ```text
 group: order-workers
 consumer: worker-{hostname}-{pid}
-字段: idempotencyKey, userId, itemId, quantity, payloadHash, acceptedAt
+字段: reservationId, idempotencyKey, userId, itemId, quantity, payloadHash, acceptedAt
 ```
 
-MVP 不裁剪 Stream，避免误删未处理消息；增长风险列入已知限制。生产可改为“确认后裁剪/按活动保留”。
+MVP 不自动裁剪 Stream，避免误删未处理消息；用 STREAM_MAX_ENTRIES（默认10000）限制整个 Stream 的条目数，包含已 ACK 条目，因此处理完成不会自动恢复这部分准入容量。适用于有限演示；达到上限返回429，由人工停入口并确认无lag、无Pending、无在途事务/补偿后清理已确认记录。上线长期运行前须实现安全的已确认消息清理；本轮不引入复杂清理协议。
 
 ### 6.2 防超卖
 
@@ -393,24 +384,25 @@ MVP 不裁剪 Stream，避免误删未处理消息；增长风险列入已知限
 | HTTP | `Idempotency-Key` 必填，按用户隔离，记录 payload 指纹 | 拒绝不同 payload 复用 |
 | Redis | Lua 中检查并写入请求状态 | 同键并发只放行一次预扣/一次入队 |
 | Stream | 至少一次投递，允许重复消息 | 不承诺 exactly-once |
-| MySQL | `UNIQUE(user_id, idempotency_key)` + 落库前回查 | 重复消息/重试只产生一个订单 |
+| MySQL | 请求行锁 + 持久请求/预约终态 + 订单唯一键 | 重复消息不重复建单，拒绝补偿后不再建单 |
 | 限购 | `user_purchases` 唯一行 + 条件更新/行锁 | 同一用户总购买量不超过限购 |
 | 取消 | 条件状态更新 + `UNIQUE(order_no, type)` | 只回补一次（DB） |
 | 支付 | 条件状态更新 + `UNIQUE(order_no, provider_txn_id)` | 重复回调幂等 |
 
-注意：Redis 幂等记录丢失后，同一幂等键可能被当作新请求再次预扣；但只要 MySQL 已有订单，Worker/查询仍按 `(user_id, idempotency_key)` 回查到同一订单。若 MySQL 也没有订单且 Stream 消息丢失，则该预约不可恢复，列入人工核查。
+Redis 幂等记录丢失后，入口必须先回源 DB 的订单及请求终态。若旧预约仍未落库而缓存已丢失，可能产生不同 reservationId 的额外预扣；Worker 按 4.3 区分同预约重投与额外预约。若 DB 无终态且 Stream 消息丢失，结果未知，按人工核查处理。
 
 ### 6.4 Redis 库存回补幂等
 
 取消回补使用 Lua：
 
 ```text
+if stock key 不存在 then return MISS（告警，不创建库存键）
 if SET sk:restocked:{orderNo} NX EX ttl then
   INCRBY sk:stock:{itemID} quantity
 end
 ```
 
-Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用按 Stream message ID 的独立补偿标记（例如 `sk:compensated:{messageID}`），避免重复 `INCRBY`。
+Worker 仅对持久终态为 REJECTED 或 EXTRA_RESERVATION 且补偿未完成的预约执行回补；同一成功预约重投不回补。补偿 Lua 使用 `sk:compensated:{reservationId}` 去重，原子完成检查库存键存在、SET NX 标记、INCRBY 和条件更新请求缓存（仅当缓存仍属于该 reservationId）。库存键缺失时不创建键、不设置标记，返回 MISS。标记在 MVP 中不设 TTL、不主动清理，以覆盖“Redis 已补偿但 DB DONE 尚未记录”的任意长重试窗口；自动清理不在本轮范围。Redis 数据丢失后的恢复必须走人工核查，不能盲目重放补偿。
 
 限制：Redis 数据丢失会同时丢失标记与库存键，极端情况下可能重复回补或库存键缺失；MySQL 条件更新仍阻止超卖，但可能造成 Redis 少卖/多放行。MVP 不自动修复，需人工核查。
 
@@ -436,7 +428,7 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
 | Worker 崩溃 | 入口仍可受理（依赖正常） | pending 消息由 `XAUTOCLAIM` 接管 | 可能短暂 `202` | 重启 Worker 自动重试（至少一次） |
 | 取消调度崩溃 | 不影响 | 订单保持待支付 | 正常 | 重启后重新扫描；条件更新防重复 |
 | 支付回调丢失 | 不影响 | 订单保持待支付，可能超时取消 | 用户可重试同一模拟支付 | 无自动对账 |
-| 库存键缺失 | `503 NOT_READY` | 不处理新单 | 可查 DB | 人工/启动预热，不自动猜值 |
+| 库存键缺失 | `503 NOT_READY` | 不处理新单 | 可查 DB | 仅新商品初始化；已有活动按人工核查恢复 |
 
 ### 7.2 结果不明处理原则
 
@@ -463,6 +455,7 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
    - `orders WHERE user_id=? AND idempotency_key=?`；
    - `orders WHERE user_id=? AND item_id=? ORDER BY id DESC`；
    - `stock_logs WHERE order_no=?`；
+   - request_results 业务键终态、reservation_results 预约终态与补偿进度；
    - 商品 `available_stock` 与 `total_stock`。
 4. 查 Redis：
    - `GET sk:req:{user}:{key}`；
@@ -471,9 +464,9 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
    - 补偿/回补标记键。
 5. 判定：
    - DB 有订单 → 以 DB 为准，更新 Redis 状态后恢复；
-   - 消息仍 pending → 允许 Worker 重试（幂等键防重）；
+   - 消息仍 pending → 先查 request_results/reservation_results：成功同预约只 ACK；拒绝/额外预约只能继续补偿；无终态且旧事务已结束才允许重试；
    - 无订单、无消息、无幂等记录 → 标记 `RESULT_UNKNOWN`，由人工决定是否允许用户用同一幂等键重试；**不自动回补**；
-   - 库存差异 → 人工以 DB 为准修正 Redis，并记录操作。
+   - 库存差异 → 先确认没有仍会落库的在途预约、未结束事务或迟到回补，再以 DB 为准修正 Redis，并记录操作；保留/核对预约补偿终态，不能单独重置库存后重放旧增量。
 6. 恢复流量前验证：订单数、库存、流水一致；记录事故与处理人。
 
 ### 7.4 明确不做/不声称
@@ -509,7 +502,7 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
 
 - `id`、`order_no`（唯一）、`user_id`、`item_id`、`activity_id`
 - `quantity`、`amount_cents`
-- `idempotency_key`、`payload_hash`
+- `idempotency_key`、`payload_hash`、`reservation_id`（原成功预约标识）
 - `status`（`PENDING_PAYMENT` / `PAID` / `CANCELLED`）
 - `expire_at`、`paid_at`、`created_at`、`updated_at`
 - 唯一：`UNIQUE(user_id, idempotency_key)`、`UNIQUE(order_no)`
@@ -532,7 +525,14 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
 - `id`、`order_no`、`provider_txn_id`、`amount_cents`、`status`、`created_at`
 - 唯一：`UNIQUE(order_no, provider_txn_id)`
 
-### 8.7 Redis Stream
+### 8.7 请求与预约终态（最小持久化防线）
+
+- `request_results`：`user_id`、`idempotency_key`、`payload_hash`、`winning_reservation_id`、`state`、`reason`、`order_no`；唯一 `(user_id, idempotency_key)`，同业务键的所有 Worker 先锁此行。
+- `reservation_results`：`reservation_id` 唯一、业务键、指纹、`outcome`、`compensation_state`；记录拒绝/额外预约终态及补偿进度。
+- 幂等键及指纹的比较必须与 Redis 一致（例如 ASCII 二进制排序规则）；不得用大小写不敏感唯一约束。
+- 不清理这些记录，不做通用工作流引擎；只覆盖防止已补偿预约再次建单的必要状态。
+
+### 8.8 Redis Stream
 
 - 不建 MySQL 表；消息保留直到 Worker 成功提交并 `XACK`。
 - MVP 不裁剪、不自动清理；运维需监控内存，人工清理前必须确认无未处理消息。
@@ -562,6 +562,9 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
   - 同一幂等键改 payload → `409 IDEMPOTENCY_CONFLICT`，不新增订单；
   - 压测中重复的 Stream 消息不新增订单。
 
+- 补充：删除 Redis 幂等键后重试、活动结束后重试、售罄后重试，均返回同一历史结果；不同 payload 始终冲突。
+- 重启时保留尚未落库预约：不得用 DB available 覆盖 Redis 预扣后的库存。
+
 ### A3 订单超时取消回补一次
 
 - 创建订单并使其过期（测试配置缩短 TTL）。
@@ -578,7 +581,10 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
 - 重启 Worker，等待 `XAUTOCLAIM` 接管 pending 消息。
 - 断言：
   - 消息最终被处理，订单只创建一次；
-  - 若“已提交但未 XACK”，重投消息被 DB 幂等键拦截，不新增订单；
+  - 若“已提交但未 XACK”，同预约重投不新增订单，Redis 库存也不得增加；
+  - 确定拒绝后补偿成功、ACK前崩溃：重投仍拒绝，不建单、不再次回补；
+  - 补偿成功、DB DONE写入前崩溃：重复Lua命中标记，完成DONE后ACK；
+  - 拒绝/补偿处理中被XAUTOCLAIM并发认领：持久终态阻止旧Worker重新建单；
   - 不因重启丢失已受理请求（前提：Redis 未丢数据）。
 
 ### A5 依赖不可用时的新订单行为
@@ -597,6 +603,7 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
 
 ### A7 可重复性
 
+- 队列容量：停止Worker，填满配置的Stream上限；后续请求返回429且库存不变，Stream长度不超过上限。已ACK记录仍计入上限，演示脚本记录清理前提。
 - 单元测试覆盖：Lua 库存/幂等逻辑（或等价 fake）、Worker 幂等落库、取消回补幂等、错误映射。
 - 集成测试覆盖 A1～A6（真实本地 Redis/MySQL，`SECKILL_IT=1` 开启）。
 - `go test -race ./...` 通过；压测脚本可重复执行并自动校验关键断言。
@@ -637,6 +644,16 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
 若时间不足，优先保证 A1、A2、A3、A4 与“依赖不可用快速失败”；压测规模、监控面板、复杂告警降级为后续。
 
 ---
+
+### 11.1 原任务交付清单
+
+- 一条命令启动：提供 make dev 或等效入口，明确 Go/MySQL/Redis 的前置安装条件、配置与依赖检查；不得把仅启动进程声称为自动安装依赖。
+- README：启动步骤、架构简述、接口示例、已实现/未实现范围与已知限制。
+- 可复现演示脚本/HTTP集合：主流程及至少一条异常路径，自动核对关键断言。
+- `docs/PROMPT_LOG.md`：保留完整 Prompt 记录或完整导出文件引用；记录 AI 建议、接受/拒绝项及理由，不以简短摘要替代原始记录。
+- 质量交付：测试与检查输出、代码审查结论、故障定位记录；未执行项必须标明。
+- 准备 5～10 分钟架构讲解，解释取舍、瓶颈、十倍流量演进，以及关键 AI 代码为何被接受或修改。
+- 这些是文档/验收要求，不新增高可用、自动对账或复杂后台。时间不足时缩减压测规模和展示，不删除幂等/重启正确性验收。
 
 ## 12. 后续方案（明确未实现）
 
@@ -680,3 +697,4 @@ Worker 因售罄/限购拒绝，或发现重复消息/已有订单时，使用�
 > - 活动未开始、已结束、库存不足时，接口返回明确的业务错误，而不是 500。
 > - 单元测试覆盖并发扣减与幂等两类场景。
 > - 服务重启后数据仍然正确，不依赖内存状态。
+
