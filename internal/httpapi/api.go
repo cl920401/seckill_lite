@@ -55,6 +55,8 @@ func New(svc Service, cfg config.Config, readiness func(context.Context) error) 
 	return api.requestID(api.logging(api.recoverer(api.bodyLimit(api.timeout(10*time.Second, mux)))))
 }
 
+// seckill 将 HTTP 参数交给服务层执行准入，并把受理/终态映射到响应；本层不直接扣库存或建单。
+// X-User-Id 是 MVP 的演示身份入口，业务幂等键按该用户隔离。
 func (a *API) seckill(w http.ResponseWriter, r *http.Request) {
 	userID, err := a.userID(r)
 	if err != nil {
@@ -79,6 +81,7 @@ func (a *API) seckill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result.HTTPStatus == http.StatusAccepted {
+		// 202 只表示预约已受理或仍在处理，不能当作订单创建成功；客户端按原幂等键轮询。
 		writeJSON(w, http.StatusAccepted, map[string]interface{}{
 			"requestId":      result.RequestID,
 			"idempotencyKey": result.IdempotencyKey,
@@ -89,6 +92,7 @@ func (a *API) seckill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result.Status == "REJECTED" {
+		// 200 表示成功读到了稳定的拒绝结果，购买是否成功还要看 status 字段。
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"requestId":      result.RequestID,
 			"idempotencyKey": result.IdempotencyKey,
@@ -117,6 +121,7 @@ func (a *API) seckill(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// requestStatus 查询购买请求的处理结果；SUCCEEDED 表示已建单，订单本身仍可能待支付或已取消。
 func (a *API) requestStatus(w http.ResponseWriter, r *http.Request) {
 	userID, err := a.userID(r)
 	if err != nil {
@@ -210,6 +215,7 @@ func (a *API) listOrders(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// payMock 仅模拟支付状态变更；订单归属、金额与支付/取消竞争在服务层和 DB 事务中校验。
 func (a *API) payMock(w http.ResponseWriter, r *http.Request) {
 	userID, err := a.userID(r)
 	if err != nil {
@@ -237,6 +243,7 @@ func (a *API) payMock(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// createActivity 创建活动和商品；201 表示 DB 创建成功，Redis 库存是否可用另看 redisReady/warnings。
 func (a *API) createActivity(w http.ResponseWriter, r *http.Request) {
 	if err := a.requireAdmin(r); err != nil {
 		a.writeError(w, r, err)
@@ -371,6 +378,7 @@ func (a *API) requireAdmin(r *http.Request) error {
 	return nil
 }
 
+// writeError 区分明确业务错误和未预期异常；503/429 不能作为换幂等键或自动回补的依据。
 func (a *API) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	appErr, ok := service.AsAppError(err)
 	if !ok {
